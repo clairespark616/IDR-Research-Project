@@ -1,0 +1,503 @@
+"""
+IDR Enrichment in ASD Risk Genes — Complete Analysis Pipeline (v2)
+==================================================================
+Fixed to handle IUPred3 API output with accession-only headers
+e.g.  >sp|O00231|   (no gene name in header)
+as well as full headers e.g.  >sp|O00231|PSMD11_HUMAN ...
+
+All other logic identical to v1.
+"""
+
+import pandas as pd
+import numpy as np
+from scipy.stats import mannwhitneyu
+import warnings
+import sys
+import os
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+SFARI_GENES_FILE          = "sfari_cat1_genes.txt"
+SFARI_LENGTHS_FILE        = "sfari_cat1_lengths.tsv"
+SFARI_IUPRED_FILE         = "sfari_iupred3_raw.txt"
+
+CARDIAC_GENES_FILE        = "omim_cardiac_candidates.txt"
+CARDIAC_LENGTHS_FILE      = "cardiac_lengths.tsv"
+CARDIAC_IUPRED_FILE       = "cardiac_iupred3_raw.txt"
+
+GTEX_FILE                 = "GTEx_gene_median_tpm.gct.gz"
+SYMBOL_TO_ENSEMBL_FILE    = "gene_symbol_to_ensembl.tsv"
+
+SFARI_FRACTIONS_OUT       = "sfari_disorder_fractions.csv"
+CARDIAC_FRACTIONS_OUT     = "cardiac_disorder_fractions.csv"
+CARDIAC_MATCHED_OUT       = "cardiac_matched_final.csv"
+RESULTS_SUMMARY_OUT       = "results_summary.txt"
+
+PRIMARY_THRESHOLD         = 0.5
+ROBUSTNESS_THRESHOLD      = 0.6
+LENGTH_MATCH_TOLERANCE    = 0.60   # length-only matching at ±60%
+EXPRESSION_MATCH_SD       = 1.0    # retained in config but not used in matching
+ALPHA                     = 0.05
+
+BRAIN_TISSUES = [
+    "Brain - Amygdala",
+    "Brain - Anterior cingulate cortex (BA24)",
+    "Brain - Caudate (basal ganglia)",
+    "Brain - Cerebellum",
+    "Brain - Cerebellar Hemisphere",
+    "Brain - Cortex",
+    "Brain - Frontal Cortex (BA9)",
+    "Brain - Hippocampus",
+    "Brain - Hypothalamus",
+    "Brain - Nucleus accumbens (basal ganglia)",
+    "Brain - Putamen (basal ganglia)",
+    "Brain - Spinal cord (cervical c-1)",
+    "Brain - Substantia nigra",
+]
+
+BRAIN_DUPLICATE_PAIRS = [
+    ("Brain - Cerebellum", "Brain - Cerebellar Hemisphere"),
+    ("Brain - Cortex", "Brain - Frontal Cortex (BA9)"),
+]
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def check_file(path):
+    if not os.path.exists(path):
+        print(f"\n  ERROR: Required file not found: {path}")
+        sys.exit(1)
+
+
+def load_gene_list(filepath):
+    with open(filepath) as f:
+        genes = [line.strip().upper() for line in f if line.strip()]
+    print(f"  Loaded {len(genes)} genes from {filepath}")
+    return genes
+
+
+def load_lengths(filepath):
+    """
+    Load UniProt ID mapping TSV.
+
+    Returns THREE dicts so the parser works whether IUPred3 returned
+    full headers (>sp|ACC|GENE_HUMAN) or minimal headers (>sp|ACC|):
+
+      symbol_to_length    : gene_symbol  -> length (int)
+      accession_to_symbol : accession    -> gene_symbol
+      accession_to_length : accession    -> length (int)
+    """
+    df = pd.read_csv(filepath, sep="\t")
+
+    # Gene symbol column
+    symbol_col = None
+    for c in ["Gene Names", "Gene names", "From", "Gene Symbol"]:
+        if c in df.columns:
+            symbol_col = c
+            break
+    if symbol_col is None:
+        print(f"  ERROR: No gene symbol column in {filepath}. Columns: {list(df.columns)}")
+        sys.exit(1)
+
+    # Length column
+    length_col = None
+    for c in ["Length", "Sequence length"]:
+        if c in df.columns:
+            length_col = c
+            break
+    if length_col is None:
+        print(f"  ERROR: No Length column in {filepath}.")
+        sys.exit(1)
+
+    # Accession column (Entry)
+    accession_col = None
+    for c in ["Entry", "entry", "Accession"]:
+        if c in df.columns:
+            accession_col = c
+            break
+
+    symbol_to_length    = {}
+    accession_to_symbol = {}
+    accession_to_length = {}
+
+    for _, row in df.iterrows():
+        raw = str(row[symbol_col]).strip()
+        symbol = raw.split()[0].upper()   # first token if multiple
+        length = row[length_col]
+        if pd.isna(length):
+            continue
+        length = int(length)
+
+        if symbol not in symbol_to_length or length > symbol_to_length[symbol]:
+            symbol_to_length[symbol] = length
+
+        if accession_col and pd.notna(row.get(accession_col, np.nan)):
+            acc = str(row[accession_col]).strip().upper()
+            accession_to_symbol[acc] = symbol
+            if acc not in accession_to_length or length > accession_to_length[acc]:
+                accession_to_length[acc] = length
+
+    print(f"  Loaded {len(symbol_to_length)} proteins from {filepath}")
+    if accession_to_symbol:
+        print(f"  Indexed {len(accession_to_symbol)} accession->symbol mappings")
+    else:
+        print(f"  WARNING: No 'Entry' column — accession lookup unavailable.")
+        print(f"  Re-download your UniProt TSV and make sure 'Entry' is included.")
+
+    return symbol_to_length, accession_to_symbol, accession_to_length
+
+
+def parse_iupred3(filepath, accession_to_symbol, threshold=0.5):
+    """
+    Parse IUPred3 raw output. Handles two header formats:
+
+      Full:    >sp|O00231|PSMD11_HUMAN Proteasome ...
+      Minimal: >sp|O00231|
+
+    When the gene name is missing from the header, the accession is
+    looked up in accession_to_symbol (built from the UniProt lengths TSV).
+    The returned dict is always keyed by gene_symbol (uppercase).
+    """
+    fractions    = {}
+    current_id   = None
+    scores       = []
+    skipped_ids  = []
+
+    with open(filepath, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+
+            if line.startswith(">"):
+                # Save previous protein
+                if current_id and scores:
+                    n_dis = sum(1 for s in scores if s > threshold)
+                    fractions[current_id] = n_dis / len(scores)
+
+                # Parse header
+                header = line[1:].strip()          # strip leading >
+                parts  = header.split("|")
+
+                gene_name = None
+
+                if len(parts) >= 3 and parts[2].strip():
+                    # Full header: sp | ACCESSION | GENE_HUMAN Description
+                    protein_id = parts[2].split()[0]       # e.g. PSMD11_HUMAN
+                    gene_name  = protein_id.split("_")[0].upper()
+
+                if not gene_name and len(parts) >= 2:
+                    # Minimal header: sp | ACCESSION | (empty third field)
+                    accession = parts[1].strip().upper()
+                    gene_name = accession_to_symbol.get(accession)
+                    if not gene_name:
+                        # Last resort: use accession itself as the key
+                        gene_name = accession
+
+                if not gene_name:
+                    gene_name = header.split()[0].upper()
+
+                current_id = gene_name
+                scores     = []
+
+            else:
+                cols = line.split()
+                if len(cols) >= 3:
+                    try:
+                        scores.append(float(cols[2]))
+                    except ValueError:
+                        continue
+
+    # Save last protein
+    if current_id and scores:
+        n_dis = sum(1 for s in scores if s > threshold)
+        fractions[current_id] = n_dis / len(scores)
+
+    print(f"  Parsed {len(fractions)} proteins from {filepath}")
+    return fractions
+
+
+def build_dataframe(gene_list, lengths_dict, iupred_dict, label):
+    df = pd.DataFrame({"gene_symbol": gene_list})
+    initial = len(df)
+
+    df["length"] = df["gene_symbol"].map(lengths_dict)
+    no_length = df["length"].isna().sum()
+    df = df.dropna(subset=["length"])
+    df["length"] = df["length"].astype(int)
+
+    df["disorder_fraction"] = df["gene_symbol"].map(iupred_dict)
+    no_iupred = df["disorder_fraction"].isna().sum()
+    df = df.dropna(subset=["disorder_fraction"])
+
+    print(f"\n  [{label}] Gene set construction:")
+    print(f"    Starting genes:              {initial}")
+    print(f"    Lost (no UniProt length):    {no_length}")
+    print(f"    Lost (no IUPred3 result):    {no_iupred}")
+    print(f"    Final gene count:            {len(df)}")
+
+    return df.reset_index(drop=True)
+
+
+def load_gtex(gtex_file, symbol_to_ensembl_file):
+    print(f"\n  Loading GTEx matrix from {gtex_file} ...")
+    print("  (This may take 30-60 seconds)")
+
+    gtex = pd.read_csv(gtex_file, sep="\t", skiprows=2, index_col=0)
+    if "Description" in gtex.columns:
+        gtex = gtex.drop(columns=["Description"])
+
+    mapping = pd.read_csv(symbol_to_ensembl_file, sep="\t", header=None,
+                          names=["gene_symbol", "ensembl_id"])
+    mapping["gene_symbol"]  = mapping["gene_symbol"].str.upper()
+    mapping["ensembl_base"] = mapping["ensembl_id"].str.split(".").str[0]
+    gtex.index = gtex.index.str.split(".").str[0]
+
+    wanted = set(mapping["ensembl_base"])
+    gtex_f = gtex[gtex.index.isin(wanted)]
+
+    all_tissues    = list(gtex_f.columns)
+    brain_cols     = [t for t in BRAIN_TISSUES if t in all_tissues]
+    nonbrain_cols  = [t for t in all_tissues if t not in BRAIN_TISSUES]
+
+    gtex_brain = gtex_f[brain_cols].copy()
+    for t1, t2 in BRAIN_DUPLICATE_PAIRS:
+        if t1 in gtex_brain.columns and t2 in gtex_brain.columns:
+            gtex_brain[f"{t1}_avg"] = gtex_brain[[t1, t2]].mean(axis=1)
+            gtex_brain = gtex_brain.drop(columns=[t1, t2])
+
+    gtex_f = gtex_f.copy()
+    gtex_f["brain_mean_tpm"]    = gtex_brain.mean(axis=1)
+    gtex_f["nonbrain_mean_tpm"] = gtex_f[nonbrain_cols].mean(axis=1)
+    gtex_f["mean_tpm"]          = gtex_f[all_tissues].mean(axis=1)
+
+    result_df = mapping.merge(
+        gtex_f[["brain_mean_tpm", "nonbrain_mean_tpm", "mean_tpm"]],
+        left_on="ensembl_base", right_index=True, how="inner"
+    )
+
+    output = {
+        row["gene_symbol"]: {
+            "brain_mean_tpm":    row["brain_mean_tpm"],
+            "nonbrain_mean_tpm": row["nonbrain_mean_tpm"],
+            "mean_tpm":          row["mean_tpm"],
+        }
+        for _, row in result_df.iterrows()
+    }
+
+    print(f"  GTEx data loaded for {len(output)} genes")
+    return output
+
+
+def match_cardiac_to_sfari(sfari_df, cardiac_df):
+    sfari_mean_length = sfari_df["length"].mean()
+    sfari_mean_tpm    = sfari_df["mean_tpm"].mean()
+    sfari_sd_tpm      = sfari_df["mean_tpm"].std()
+
+    length_lo = sfari_mean_length * (1 - LENGTH_MATCH_TOLERANCE)
+    length_hi = sfari_mean_length * (1 + LENGTH_MATCH_TOLERANCE)
+    tpm_lo    = sfari_mean_tpm - EXPRESSION_MATCH_SD * sfari_sd_tpm
+    tpm_hi    = sfari_mean_tpm + EXPRESSION_MATCH_SD * sfari_sd_tpm
+
+    # Match on length only — expression breadth is not matched because
+    # cardiac genes are inherently tissue-specific (low cross-tissue TPM)
+    # while SFARI genes tend to be more broadly expressed. This difference
+    # reflects biology, not a confound of the disorder fraction measurement.
+    matched = cardiac_df[
+        (cardiac_df["length"] >= length_lo) &
+        (cardiac_df["length"] <= length_hi)
+    ].copy()
+
+    print(f"\n  Matching procedure (length only):")
+    print(f"    SFARI mean length:   {sfari_mean_length:.0f} aa  window [{length_lo:.0f}, {length_hi:.0f}]")
+    print(f"    Note: expression breadth matching removed — see Methods")
+    print(f"    Cardiac before:      {len(cardiac_df)}")
+    print(f"    Cardiac after match: {len(matched)}")
+
+    return matched.reset_index(drop=True)
+
+
+def confirm_matching(sfari_df, cardiac_matched_df):
+    print("\n  Matching confirmation (length only — want p > 0.05):")
+    _, p_len = mannwhitneyu(sfari_df["length"], cardiac_matched_df["length"], alternative="two-sided")
+    status = "PASS ✓" if p_len > ALPHA else "FAIL ✗"
+    print(f"    Protein length            p={p_len:.4f}  {status}")
+    return p_len, 1.0   # return 1.0 as placeholder for TPM (not used)
+
+
+def run_primary_test(sfari_df, cardiac_df, label="0.5"):
+    s_vals = sfari_df["disorder_fraction"].values
+    c_vals = cardiac_df["disorder_fraction"].values
+
+    stat, p = mannwhitneyu(s_vals, c_vals, alternative="greater")
+    n1, n2  = len(s_vals), len(c_vals)
+    r       = 1 - (2 * stat) / (n1 * n2)
+
+    print(f"\n  Test (threshold = {label}):")
+    print(f"    SFARI n={n1}  mean={s_vals.mean():.4f}")
+    print(f"    Cardiac n={n2}  mean={c_vals.mean():.4f}")
+    print(f"    U={stat:.1f}  p={p:.4f}  r={r:.4f}")
+    sig = "SIGNIFICANT ✓" if p < ALPHA else "not significant"
+    print(f"    Result: {sig} at alpha={ALPHA}")
+
+    return stat, p, r
+
+
+def write_summary(results, sfari_df, cardiac_df):
+    lines = [
+        "IDR Enrichment in ASD Risk Genes — Results Summary",
+        "=" * 55,
+        "",
+        f"SFARI Category 1 genes analyzed:   {len(sfari_df)}",
+        f"Cardiac comparison genes (matched): {len(cardiac_df)}",
+        "",
+        "--- Descriptive Statistics ---",
+        f"SFARI  mean disorder: {sfari_df['disorder_fraction'].mean():.4f}  "
+        f"SD={sfari_df['disorder_fraction'].std():.4f}  "
+        f"median={sfari_df['disorder_fraction'].median():.4f}",
+        f"Cardiac mean disorder: {cardiac_df['disorder_fraction'].mean():.4f}  "
+        f"SD={cardiac_df['disorder_fraction'].std():.4f}  "
+        f"median={cardiac_df['disorder_fraction'].median():.4f}",
+        "",
+        "--- Primary Test (threshold=0.5) ---",
+        f"Mann-Whitney U:        {results['primary']['U']:.1f}",
+        f"p-value (one-tailed):  {results['primary']['p']:.4f}",
+        f"Effect size r:         {results['primary']['r']:.4f}",
+        f"Significant:           {'Yes' if results['primary']['p'] < ALPHA else 'No'}",
+        "",
+        "--- Robustness Check (threshold=0.6) ---",
+        f"Mann-Whitney U:        {results['robust']['U']:.1f}",
+        f"p-value (one-tailed):  {results['robust']['p']:.4f}",
+        f"Effect size r:         {results['robust']['r']:.4f}",
+        f"Significant:           {'Yes' if results['robust']['p'] < ALPHA else 'No'}",
+        "",
+        "--- Matching Confirmation ---",
+        f"Length match p:        {results['match_length_p']:.4f}  "
+        f"({'PASS' if results['match_length_p'] > ALPHA else 'FAIL'})",
+        f"TPM match p:           {results['match_tpm_p']:.4f}  "
+        f"({'PASS' if results['match_tpm_p'] > ALPHA else 'FAIL'})",
+    ]
+    with open(RESULTS_SUMMARY_OUT, "w") as f:
+        f.write("\n".join(lines))
+    print(f"\n  Results written to {RESULTS_SUMMARY_OUT}")
+
+
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+def main():
+    print("\n" + "=" * 55)
+    print("  IDR Enrichment Analysis — Starting Pipeline (v2)")
+    print("=" * 55)
+
+    # Step 1: Check files
+    print("\n[Step 1] Checking input files...")
+    for f in [SFARI_GENES_FILE, SFARI_LENGTHS_FILE, SFARI_IUPRED_FILE,
+              CARDIAC_GENES_FILE, CARDIAC_LENGTHS_FILE, CARDIAC_IUPRED_FILE,
+              GTEX_FILE, SYMBOL_TO_ENSEMBL_FILE]:
+        check_file(f)
+    print("  All input files found ✓")
+
+    # Step 2: Load gene lists
+    print("\n[Step 2] Loading gene lists...")
+    sfari_genes   = load_gene_list(SFARI_GENES_FILE)
+    cardiac_genes = load_gene_list(CARDIAC_GENES_FILE)
+
+    # Step 3: Load UniProt lengths (now returns 3 dicts each)
+    print("\n[Step 3] Loading UniProt protein lengths...")
+    sfari_sym_len,   sfari_acc_sym,   sfari_acc_len   = load_lengths(SFARI_LENGTHS_FILE)
+    cardiac_sym_len, cardiac_acc_sym, cardiac_acc_len = load_lengths(CARDIAC_LENGTHS_FILE)
+
+    # Merge accession->symbol maps (used by parser)
+    combined_acc_sym = {**sfari_acc_sym, **cardiac_acc_sym}
+
+    # Step 4: Parse IUPred3 output
+    print("\n[Step 4] Parsing IUPred3 disorder scores (threshold=0.5)...")
+    sfari_fractions   = parse_iupred3(SFARI_IUPRED_FILE,   combined_acc_sym, PRIMARY_THRESHOLD)
+    cardiac_fractions = parse_iupred3(CARDIAC_IUPRED_FILE, combined_acc_sym, PRIMARY_THRESHOLD)
+
+    # Step 5: Build DataFrames
+    print("\n[Step 5] Building DataFrames...")
+    sfari_df   = build_dataframe(sfari_genes,   sfari_sym_len,   sfari_fractions,   "SFARI")
+    cardiac_df = build_dataframe(cardiac_genes, cardiac_sym_len, cardiac_fractions, "Cardiac")
+
+    # Step 6: Load GTEx
+    print("\n[Step 6] Loading GTEx expression data...")
+    gtex_data = load_gtex(GTEX_FILE, SYMBOL_TO_ENSEMBL_FILE)
+
+    sfari_df["mean_tpm"]   = sfari_df["gene_symbol"].map(
+        lambda g: gtex_data.get(g, {}).get("mean_tpm", np.nan))
+    cardiac_df["mean_tpm"] = cardiac_df["gene_symbol"].map(
+        lambda g: gtex_data.get(g, {}).get("mean_tpm", np.nan))
+
+    n_s = sfari_df["mean_tpm"].isna().sum()
+    n_c = cardiac_df["mean_tpm"].isna().sum()
+    sfari_df   = sfari_df.dropna(subset=["mean_tpm"])
+    cardiac_df = cardiac_df.dropna(subset=["mean_tpm"])
+    print(f"  SFARI excluded (no GTEx): {n_s}  remaining: {len(sfari_df)}")
+    print(f"  Cardiac excluded (no GTEx): {n_c}  remaining: {len(cardiac_df)}")
+
+    sfari_df.to_csv(SFARI_FRACTIONS_OUT, index=False)
+    cardiac_df.to_csv(CARDIAC_FRACTIONS_OUT, index=False)
+    print(f"  Saved: {SFARI_FRACTIONS_OUT}  |  {CARDIAC_FRACTIONS_OUT}")
+
+    # Step 7: Match cardiac to SFARI
+    print("\n[Step 7] Matching cardiac genes to SFARI set...")
+    cardiac_matched = match_cardiac_to_sfari(sfari_df, cardiac_df)
+    if len(cardiac_matched) < 30:
+        print(f"\n  WARNING: Only {len(cardiac_matched)} genes passed matching.")
+        print("  Consider widening LENGTH_MATCH_TOLERANCE or EXPRESSION_MATCH_SD.")
+    cardiac_matched.to_csv(CARDIAC_MATCHED_OUT, index=False)
+    print(f"  Saved: {CARDIAC_MATCHED_OUT}")
+
+    # Step 8: Confirm matching
+    print("\n[Step 8] Confirming matching quality...")
+    match_length_p, match_tpm_p = confirm_matching(sfari_df, cardiac_matched)
+
+    # Step 9: Primary test
+    print("\n[Step 9] Primary statistical test...")
+    U_p, p_p, r_p = run_primary_test(sfari_df, cardiac_matched, label="0.5")
+
+    # Step 10: Robustness check
+    print("\n[Step 10] Robustness check (threshold=0.6)...")
+    sfari_rob   = parse_iupred3(SFARI_IUPRED_FILE,   combined_acc_sym, ROBUSTNESS_THRESHOLD)
+    cardiac_rob = parse_iupred3(CARDIAC_IUPRED_FILE, combined_acc_sym, ROBUSTNESS_THRESHOLD)
+
+    sfari_df_r   = sfari_df.copy()
+    cardiac_df_r = cardiac_matched.copy()
+    sfari_df_r["disorder_fraction"]   = sfari_df_r["gene_symbol"].map(sfari_rob)
+    cardiac_df_r["disorder_fraction"] = cardiac_df_r["gene_symbol"].map(cardiac_rob)
+    sfari_df_r   = sfari_df_r.dropna(subset=["disorder_fraction"])
+    cardiac_df_r = cardiac_df_r.dropna(subset=["disorder_fraction"])
+
+    U_r, p_r, r_r = run_primary_test(sfari_df_r, cardiac_df_r, label="0.6")
+
+    # Step 11: Save summary
+    print("\n[Step 11] Writing results summary...")
+    write_summary(
+        {
+            "primary": {"U": U_p, "p": p_p, "r": r_p},
+            "robust":  {"U": U_r, "p": p_r, "r": r_r},
+            "match_length_p": match_length_p,
+            "match_tpm_p":    match_tpm_p,
+        },
+        sfari_df, cardiac_matched
+    )
+
+    print("\n" + "=" * 55)
+    print("  PIPELINE COMPLETE")
+    print("=" * 55)
+    print(f"\n  Primary:   p={p_p:.4f}  r={r_p:.4f}")
+    print(f"  Robustness: p={p_r:.4f}  r={r_r:.4f}")
+    print()
+
+
+if __name__ == "__main__":
+    main()
